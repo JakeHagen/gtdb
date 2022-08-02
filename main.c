@@ -7,9 +7,13 @@
 #include <errno.h>
 
 #include "rocksdb/c.h"
-#include "htslib/bgzf.h"
-#include <htslib/vcf.h>
+//#include "htslib/bgzf.h"
+#include "htslib/vcf.h"
 #include "htslib/kstring.h"
+
+#include "htslib/khash.h"
+KHASH_MAP_INIT_STR(vdict, bcf_idinfo_t)
+typedef khash_t(vdict) vdict_t;
 
 typedef struct _args_t
 {
@@ -56,8 +60,20 @@ kstring_t mk_key_nfmts(bcf1_t *line) {
         for (i = 0; i < line->n_allele; i++) {
                 kputs(line->d.allele[i], &key);
         }
-	kputw(line->n_fmt, &key);
+	kputc('-', &key);
         return key;
+}
+
+int verify_fmt_keys(bcf_hdr_t *hdr, bcf_hdr_t *fhdr) {
+          khint_t k;
+          for (k=0; k<*fhdr->n; k++) {
+		  if (strcmp(hdr->id[0][k].key, fhdr->id[0][k].key)) {
+			  fprintf(stderr, "%s != %s\n", hdr->id[0][k].key, fhdr->id[0][k].key);
+			  return -1;
+		  }
+
+          }
+          return 0;
   }
 
 kstring_t mk_hdr_path(char *db_path) {
@@ -76,6 +92,7 @@ int set_write_options(rocksdb_options_t *options, args_t *args) {
         rocksdb_options_set_blob_compression_type(options, args->compression);
         rocksdb_options_prepare_for_bulk_load(options);
         rocksdb_options_set_write_buffer_size(options, 100000000);
+
 	return 0;
 }
 
@@ -94,7 +111,7 @@ int store(args_t *args) {
 	rocksdb_options_t *options = rocksdb_options_create();
         char *err = NULL;
         
-	//open db
+	//open dbq
 	set_write_options(options, args);
 	db = rocksdb_open(options, args->database, &err);
 	assert(!err);
@@ -103,7 +120,7 @@ int store(args_t *args) {
 	
 	hts_set_threads(ihf, args->threads);
 	bcf_hdr_t *ihdr = bcf_hdr_read(ihf);
-	uint32_t nfmt = get_nfmt(ihdr);
+	//uint32_t nfmt = get_nfmt(ihdr);
 
 	//write hdr into db directory
 	//open hdr htsfile and write
@@ -115,7 +132,7 @@ int store(args_t *args) {
 	htsFile *ohf = hts_open(args->output, "wb");
 	hts_set_threads(ohf, args->threads);
 	bcf_hdr_t *ohdr = bcf_hdr_subset(ihdr, 0, 0, 0);
-	bcf_hdr_remove(ohdr, BCF_HL_FMT, NULL);
+	//bcf_hdr_remove(ohdr, BCF_HL_FMT, NULL);
 	if ( bcf_hdr_write(ohf, ohdr)!=0 ) error("Error: cannot write output header\n");
 
 	bcf1_t *line = bcf_init();
@@ -123,14 +140,18 @@ int store(args_t *args) {
 	rocksdb_writeoptions_t *writeoptions = rocksdb_writeoptions_create();
 	
 	while (bcf_read(ihf, ihdr, line) == 0) {
-		if (nfmt != line->n_fmt) {
-			error("Error: number of format fields at line do not equal number in header");			
-		}
 		kstring_t key = mk_key(line);
 
 		rocksdb_put(db, writeoptions, ks_str(&key), ks_len(&key), line->indiv.s, line->indiv.l, &err);
 		assert(!err);
-		
+
+		kstring_t n_fmt = {0,0,0};
+		kputw(line->n_fmt, &n_fmt);
+		kstring_t fkey = mk_key_nfmts(line);
+		rocksdb_put(db, writeoptions, ks_str(&fkey), ks_len(&fkey), n_fmt.s, n_fmt.l, &err);
+		assert(!err);
+
+		//bcf_update_info(ohdr, line, "nfmt", line->n_fmt, 1, BCF_HT_INT);
 		bcf_subset(ohdr, line, 0, 0);
 		bcf_write(ohf, ohdr, line);
 	}
@@ -153,15 +174,21 @@ int store(args_t *args) {
 }
 
 void get(args_t *args) {
+	//open input and get header, input should not have any individual sample fields (format fields) or samples,
+	//but it should have format keys in header unless it was kept in bcf format while detached from format fields
 	htsFile *hf = hts_open(args->input, "r");
 	hts_set_threads(hf, args->threads);
 	bcf_hdr_t *hdr = bcf_hdr_read(hf);
 
+	//open hdr file that contains format fields and samples
 	kstring_t ffp = mk_hdr_path(args->database);
         htsFile *fhf = hts_open(ks_str(&ffp), "r");
 	bcf_hdr_t *fhdr = bcf_hdr_read(fhf);
 
-	uint32_t nfmt = get_nfmt(fhdr); 
+	//check that the link between info and format keys and ids has been preserved
+	if ( verify_fmt_keys(hdr, fhdr)!=0 ) error("Error: position of format keys does not match\n");
+
+	//uint32_t nfmt = get_nfmt(fhdr); 
 
 	bcf_hdr_merge(fhdr, hdr);
         bcf_hdr_sync(fhdr);
@@ -194,7 +221,11 @@ void get(args_t *args) {
 		line->indiv.s = rocksdb_get(db, readoptions, ks_str(&key), ks_len(&key), &line->indiv.l, &err);
 		assert(!err);
 
-		line->n_fmt = nfmt;
+		kstring_t fkey = mk_key_nfmts(line);
+		kstring_t nfmtsc = {0,0,0};
+		nfmtsc.s = rocksdb_get(db, readoptions, ks_str(&fkey), ks_len(&fkey), &nfmtsc.l, &err);
+		line->n_fmt = atoi(ks_str(&nfmtsc));
+		//fprintf(stderr, "%s\n", ks_str(&nfmtsc));
 		line->n_sample =  bcf_hdr_nsamples(fhdr);
 		bcf_write(out, fhdr, line);
 	}
